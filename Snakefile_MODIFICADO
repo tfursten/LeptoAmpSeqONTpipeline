@@ -1,0 +1,368 @@
+###############################################################################
+# PIPELINE PARA ANÁLISIS DE AMPSEQ
+# NOTA: El Snakefile es un pipeline de consenso para amplicones ONT (Nanopore), pensado para: 
+# 1. Alinear reads contra un genoma de referencia
+# 2. Encontrar mutaciones (SNPs)
+# 3. Decidir, posición por posición, cuál es la base consenso
+# 4. Generar una tabla final con las llamadas por muestra y posición (REF / ALT / N).
+### Interpretación:
+### A / C / G / T  → base determinada con suficiente información
+### N              → no hay suficiente cobertura o confianza
+#
+# Útil para comparar muestras y ver si una muestra “es igual o distinta” al genoma de referencia.
+############################################################################### 
+
+
+############################################################################### 
+# FUNCIONAMIENTO DEL ARCHIVO SNAKEFILE
+### Cada rule es un paso en donde se definen qué archivos entran (input), qué archivos salen (output) y qué comando los produce.
+###############################################################################
+
+
+###############################################################################
+# DEFINICIÓN DE MUESTRAS
+### Primero se deben definir las muestras y para esto, es necesario que todas las muestras tengan una misma palabra al inicio (ej. "barcode", "sample") para facilitar el procesamiento simultáneo automatizado.
+#  - El comando "SAMPLES, = glob_wildcards("reads/{sample}.fastq")" va a reconocer todos los fastqs con la palabra {sample} al inicio; pero puedes cambiarlo a cualquier otra palabra (ej. barcode). Recomiendo usar la nomenclatura: sample_Código_Localidad.fastq
+###############################################################################
+SAMPLES, = glob_wildcards("reads/{sample}.fastq")
+
+
+###############################################################################
+# DEFINICIÓN DE GENOMAS DE REFERENCIA.
+### Tara emplea el genoma de Leptospira interrogans GCF_000007685.1.
+#  - Se podría usar cualquier otro genoma de referencia TOMANDO EN CUENTA que el archivo posterior que vamos a usar .bed debe contener las posiciones de las regiones de interés respecto al genoma de referencia analizado.
+###############################################################################
+REF = "reference/GCF_000007685.1_ASM768v1_genomic.fasta"
+
+
+###############################################################################
+# DEFINICIÓN DE POSICIONES CON INFORMACIÓN RELEVANTE
+### Archivo .bed tiene la posición inicial y posición final de las regiones de interés con SNPs informativos RESPECTO al genoma de Leptospira interrogans GCF_000007685.1 USADO POR TARA.
+# - Este archivo fue enviado por Tara con todas las regiones analizadas por NAU. 
+# - Se puede emplear otro archivo .bed; simplemente se deberían anotar cuales son las posiciones de las regiones de interés en ese otro genoma de referencia.
+###############################################################################
+BED_CALLABLE = 'lepto.new.bed'
+
+
+###############################################################################
+# PARÁMETROS PARA LLAMAR BASES CONSENSOS
+### Estas variables definen cuán estrictos somos al decidir una base:
+# - Si una posición no cumple estos criterios → se marca como "N"
+# - Cambiarlos hace el consenso más estricto o más permisivo 
+
+MIN_DP_CALL = 15      # lecturas mínimas para asignar una base, caso contrario N
+MIN_DP_VAR  = 5      # lecturas mínimas para considerar un SNP
+MIN_ALT_AF  = 0.80    # fracción mínima de lecturas ALT (80%)
+MIN_ALT_READS = 10    # mínimo de lecturas ALT totales
+MIN_STRAND_ALT = 3    # mínimo de lecturas ALT por hebra
+MIN_QUAL = 15         # calidad mínima del SNP
+MIN_MQ = 15           # calidad mínima del alineamiento
+
+# ALT -> Alelo alternativo (ALT)
+# REF -> Alelo de referencia
+# N -> Sin consenso, no hay información/poca profundidad de secuenciamiento
+###############################################################################
+
+
+###############################################################################
+# REGLA FINAL (rule all)
+### El comando "rule all" le dice a Snakemake: "El análisis termina cuando existan TODOS estos archivos"
+# En este caso, el pipeline termina cuando hayan todos los siguientes archivos:
+### - "expand("variants/{sample}.consensus.snps.vcf.gz", sample=SAMPLES)": archivos VCF comprimidos con SNPs consensos por muestra que han sido filtrados según los umbrales antes especificados(MIN_DP, MIN_ALT_AF, etc.)
+### - "expand("variants/{sample}.consensus.snps.vcf.gz.tbi", sample=SAMPLES)": exige el índice .tbi del VCF anterior
+### - "expand("calls/{sample}.consensus_calls.tsv", sample=SAMPLES)": archivo TSV por muestra que suele contener normalmente: Posición, Base consenso, Depth, AF, Flags de calidad. Estos datos son las que permiten construir la matriz de SNPs. 
+### - #"pileup_summary/all_samples_calls.tsv: un archivo .tsv que contiene los núcleotidos en cada posición de interés de todas las muestras analizadas en comparación con la referencia. 
+###############################################################################
+rule all:
+    input:
+        expand("variants/{sample}.consensus.snps.vcf.gz", sample=SAMPLES),
+        expand("variants/{sample}.consensus.snps.vcf.gz.tbi", sample=SAMPLES),
+        expand("calls/{sample}.consensus_calls.tsv", sample=SAMPLES),
+        expand("calls/all_samples_consensus_calls.tsv", sample=SAMPLES),
+        expand("coverage/{sample}_coverage.tsv", sample=SAMPLES),
+        #"pileup_summary/all_samples_calls.tsv"
+
+
+###############################################################################
+# REGLA minimap2_align_sort_index_ont
+#
+### ENTRADA
+# - FASTQ con lecturas Nanopore
+# - Genoma de referencia
+#
+### PROCESO
+# Alinea lecturas ONT contra un genoma de referencia y genera un BAM ordenado e indexado por muestra. #
+#
+### RESULTADO
+# - BAM ordenado e indexado por muestra
+###############################################################################
+rule minimap2_align_sort_index_ont:
+    input:
+        reads="reads/{sample}.fastq",
+        ref=REF
+    output:
+        bam="sorted_alignments/{sample}.sorted.bam",
+        bai="sorted_alignments/{sample}.sorted.bam.bai"
+    threads: 8
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p sorted_alignments
+
+        minimap2 -ax map-ont -t {threads} {input.ref} {input.reads} \
+          | samtools sort -@ {threads} -o {output.bam} -
+
+        samtools index {output.bam}
+        """
+
+
+###############################################################################
+# REGLA restrict_to_callable_regions
+#
+### ENTRADA
+# - Archivo .bed antes ya especificado como "BED_CALLABLE" en donde están solo las regiones con SNPs informativos amplificados con AmpSeq; EXCLUYENDO las regiones de primers. 
+# - BAM ordenado e indexado por muestra
+#
+### PROCESO
+# Selecciona únicamente el interior de los amplicones. En otras palabras, el comando toma el BAM alineado y recorta únicamente las regiones especificadas en el archivo BED
+#
+### RESULTADO
+# - BAM con solo reads en las regiones de interés; es decir, más “limpio” e indexado
+###############################################################################
+rule restrict_to_callable_regions:
+    input:
+        bam="sorted_alignments/{sample}.sorted.bam",
+        bai="sorted_alignments/{sample}.sorted.bam.bai",
+        bed=BED_CALLABLE
+    output:
+        bam="filtered_alignments/{sample}.callable.bam",
+        bai="filtered_alignments/{sample}.callable.bam.bai"
+    threads: 4
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p filtered_alignments
+
+        samtools view -@ {threads} -b -L {input.bed} {input.bam} > {output.bam}
+        samtools index {output.bam}
+        """
+
+
+###############################################################################
+# REGLA coverage_per_region
+#
+### ENTRADA
+# - Archivo BED
+# - BAM con solo reads en las regiones de interés
+#
+### PROCESO
+# Calcula cobertura media por amplicon permitiendo identificar qué regiones tienen baja cobertura y excluirlos. Este análisis luego se utiliza para asignar nucleótidos o Ns en la secuencia consenso. 
+#
+### RESULTADO
+# - Archivo .tsv que indica el la cobertura promedio en cada región amplificada por AmpSeq
+###############################################################################
+rule coverage_per_region:
+    input:
+        bam="filtered_alignments/{sample}.callable.bam",
+        bed=BED_CALLABLE
+    output:
+        tsv="coverage/{sample}_coverage.tsv"
+    conda: "nanopore"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p coverage
+        bedtools coverage -a {input.bed} -b {input.bam} -mean > {output.tsv}
+        """
+
+
+###############################################################################
+# REGLA call_snps_raw
+### ENTRADA
+# - BAM con solo reads en las regiones de interés
+# - Archivo con genoma de referencia
+#
+### PROCESO
+# Usa bcftools para detectar posibles SNPs; sin embargo, no se filtra nada todavía.
+#
+### RESULTADO
+# - Archivo .vcf.gz : un formato de llamada de variante comprimido en bloque que contiene datos de variantes genéticas (SNV) SIN NINGUN TIPO DE FILTRO
+# - Archivo .vcf.gz.tbi : tabix index file
+###############################################################################
+rule call_snps_raw:
+    input:
+        bam="filtered_alignments/{sample}.callable.bam",
+        bai="filtered_alignments/{sample}.callable.bam.bai",
+        ref=REF
+    output:
+        vcf="variants/{sample}.raw.vcf.gz",
+        tbi="variants/{sample}.raw.vcf.gz.tbi"
+    conda: "nanopore"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p variants
+
+        bcftools mpileup -Ou -f {input.ref} \
+          -q 20 -Q 10 \
+          -a FORMAT/DP,FORMAT/AD,FORMAT/DP4 \
+          {input.bam} \
+        | bcftools call --ploidy 1 -m -v -Oz -o {output.vcf}
+
+        bcftools index -t {output.vcf}
+        """
+
+
+###############################################################################
+# REGLA filter_snps_consensus
+### ENTRADA
+# - Archivo .vcf.gz : un archivo de formato de llamada de variante comprimido en bloque que contiene datos de variantes genéticas (SNV) SIN NINGUN TIPO DE FILTRO
+# - Archivo .vcf.gz.tbi : taxi index file
+#
+### PROCESO
+# Elimina los consensos con poca cobertura, baja calidad y baja fracción alélica. Es decir, se queda solo con SNPs confiables.
+## En este caso, se usan los parámetros especificados previamente tales como calidad ≥20, cobertura ≥5, y donde ≥80% de lecturas apoyen el alelo ALT. 
+#
+### RESULTADO
+# - Archivo .vcf con consensos de SNPs de alta confianza
+# - Archivo .vcf.gz.tbi con tabix index file de los consensos de SNPs
+###############################################################################
+rule filter_snps_consensus:
+    input:
+        vcf="variants/{sample}.raw.vcf.gz",
+        tbi="variants/{sample}.raw.vcf.gz.tbi"
+    output:
+        vcf="variants/{sample}.consensus.snps.vcf.gz",
+        tbi="variants/{sample}.consensus.snps.vcf.gz.tbi"
+    conda: "nanopore"
+    shell:
+        r"""
+        set -euo pipefail
+
+        bcftools filter -e '
+          TYPE!="snp" ||
+          QUAL<20 ||
+          FORMAT/DP<5 ||
+          (FORMAT/AD[0:1]/FORMAT/DP)<0.8
+        ' {input.vcf} -Oz -o {output.vcf}
+
+        bcftools index -t {output.vcf}
+        """
+
+###############################################################################
+# REGLA consensus_call_table
+### ENTRADA
+# - Archivo .vcf con consensos de SNPs de alta confianza
+# - Archivo .vcf.gz.tbi con tabix index file de los consensos de SNPs
+# - Archivo con genoma de referencia (REF)
+#
+### PROCESO
+# Construye una tabla que, para cada posición genómica “callable”, decide si la muestra tiene el alelo alternativo (ALT), el alelo de referencia (REF) o “N”, según la cobertura y los SNPs de consenso. Con cobertura suficiente, se asigna la base mayoritaria observada en las lecturas si supera los umbrales; si no, se asigna N. El VCF se sigue generando sin modificar las reglas originales.
+#
+### RESULTADO
+# - Tabla en formato TSV, una por cada muestra
+## Filas: A/C/G/T/N en cada posición genómica
+## Columnas: Referencia y Muestra
+###############################################################################
+rule consensus_call_table:
+    input:
+        bam="filtered_alignments/{sample}.callable.bam",
+        bai="filtered_alignments/{sample}.callable.bam.bai",
+        ref=REF,
+        bed=BED_CALLABLE,
+        snps="variants/{sample}.consensus.snps.vcf.gz",
+        snps_tbi="variants/{sample}.consensus.snps.vcf.gz.tbi"
+    output:
+        tsv="calls/{sample}.consensus_calls.tsv"
+    run:
+        import os
+        import subprocess
+        import pandas as pd
+
+        os.makedirs("calls", exist_ok=True)
+
+        # ÚNICO CAMBIO FUNCIONAL: llamar la base respaldada por las lecturas
+        # mediante samtools mpileup (ya usado en este pipeline). No sustituir
+        # automáticamente posiciones sin SNP aceptado por la referencia.
+        # -q filtra MAPQ; -Q filtra calidad de base; -aa conserva cero cobertura.
+        cmd = ["samtools", "mpileup", "-aa", "-q", str(MIN_MQ), "-Q", "10",
+               "-f", input.ref, "-l", input.bed, input.bam]
+        pileup = subprocess.check_output(cmd, text=True)
+
+        def read_bases(pileup_bases, reference):
+            """Cuenta A/C/G/T del pileup; ignora indels y marcas SAMtools."""
+            counts = {b: 0 for b in "ACGT"}
+            i = 0
+            while i < len(pileup_bases):
+                c = pileup_bases[i]
+                if c == "^":
+                    i += 2  # '^' seguido de carácter de calidad de mapeo
+                elif c == "$":
+                    i += 1
+                elif c in "+-":
+                    i += 1
+                    j = i
+                    while i < len(pileup_bases) and pileup_bases[i].isdigit():
+                        i += 1
+                    if j == i:
+                        raise ValueError("Indel mal formado en mpileup")
+                    i += int(pileup_bases[j:i])
+                elif c in ".,":
+                    if reference in counts:
+                        counts[reference] += 1
+                    i += 1
+                elif c.upper() in counts:
+                    counts[c.upper()] += 1
+                    i += 1
+                else:
+                    # '*', '#', '<', '>', 'N' son bases no utilizables
+                    i += 1
+            return counts
+
+        rows = []
+        for line in pileup.splitlines():
+            fields = line.split("\t")
+            if len(fields) < 5:
+                continue
+            chrom, pos, refbase = fields[0], int(fields[1]), fields[2].upper()
+            counts = read_bases(fields[4], refbase)
+            depth = sum(counts.values())
+            base, support = max(counts.items(), key=lambda kv: kv[1])
+            # Una base se llama únicamente cuando está respaldada por lecturas.
+            # Para mezclas o cobertura insuficiente, usar N.
+            valid = (depth >= MIN_DP_CALL and support >= MIN_ALT_READS and
+                     support / depth >= MIN_ALT_AF)
+            rows.append((chrom, pos, depth, base if valid else "N"))
+
+        # Mantener exactamente el formato de salida del Snakefile original.
+        pd.DataFrame(rows, columns=["Chrom", "Pos", "Depth", "Call"]).to_csv(
+            output.tsv, sep="\t", index=False
+        )
+
+
+###############################################################################
+# REGLA combine_calls
+## ENTRADA
+# - Archivos .tsv de todas las muestras previamente analizadas
+#
+## PROCESO
+# Une las llamadas de consenso de todas las muestras en una sola matriz. 
+#
+## RESULTADOS
+# - El "archivo estrella" del análisis es "calls/all_samples_consensus_calls.tsv"
+## Filas: A/C/G/T/N en cada posición genómica
+## Columnas: Muestras 
+###############################################################################
+rule combine_calls:
+    input:
+        expand("calls/{sample}.consensus_calls.tsv", sample=SAMPLES)
+    output:
+        "calls/all_samples_consensus_calls.tsv"
+    run:
+        import pandas as pd
+        mats = []
+        for f, s in zip(input, SAMPLES):
+            df = pd.read_csv(f, sep="\t").set_index(["Chrom","Pos"])
+            mats.append(df["Call"].rename(s))
+        mat = pd.concat(mats, axis=1).sort_index().fillna("N")
+        mat.to_csv(output[0], sep="\t", index=True)
